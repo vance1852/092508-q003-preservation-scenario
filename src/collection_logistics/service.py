@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, Forbidden, InvalidState, NotFound, ScenarioInputMissing, ValidationFailed
 from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
 from .planning import (
     AllocationRequest,
@@ -495,6 +495,29 @@ class CollectionLogisticsService:
             self._audit("scenario", scenario_id, "scenario.approved", actor_id, {})
         return {"scenario_id": scenario_id, "state": "approved", "revision": expected_revision + 1}
 
+    def _scenario_index_input(self, risk_index: str, as_of_date: str) -> dict[str, str]:
+        """选择指定指标系列在 as_of_date 当时有效的最新修订版本。"""
+        row = self.connection.execute(
+            "SELECT risk_record_id,duty_date,index_value,source_revision,observed_at,recorded_by,recorded_at "
+            "FROM risk_index_risk_records WHERE risk_index=? AND duty_date<=? "
+            "ORDER BY duty_date DESC,risk_record_id DESC LIMIT 1",
+            (risk_index, as_of_date),
+        ).fetchone()
+        if row is None:
+            raise ScenarioInputMissing(
+                f"截止 {as_of_date} 没有指标系列 {risk_index} 的有效修订版本，无法运行情景"
+            )
+        return {
+            "risk_index": risk_index,
+            "risk_record_id": str(row["risk_record_id"]),
+            "duty_date": row["duty_date"],
+            "index_value": row["index_value"],
+            "source_revision": row["source_revision"],
+            "observed_at": row["observed_at"],
+            "recorded_by": row["recorded_by"],
+            "recorded_at": row["recorded_at"],
+        }
+
     def run_scenario(self, actor_id: str, scenario_id: str, as_of_date: str) -> dict[str, Any]:
         self._require(actor_id, "scenario.run")
         row = self.connection.execute(
@@ -504,13 +527,42 @@ class CollectionLogisticsService:
             raise NotFound("情景不存在")
         if row["state"] != "approved":
             raise InvalidState("只有已批准情景可以运行")
-        scenario = ResponseScenario.from_dict(json.loads(row["definition_json"]))
-        index_row = self.connection.execute(
-            "SELECT index_value FROM risk_index_risk_records WHERE duty_date<=? ORDER BY duty_date DESC,risk_record_id DESC LIMIT 1",
-            (as_of_date,),
+        # 历史方案一律按冻结输入重放，不受后来补录或更正数据影响。
+        # 查询放在解析当前定义之前：修复前的旧定义可能缺少 risk_index，但仍须可重放。
+        frozen = self.connection.execute(
+            "SELECT r.run_id,r.result_json FROM response_scenario_runs r "
+            "JOIN response_scenario_run_inputs i ON i.run_id=r.run_id "
+            "WHERE r.scenario_id=? AND r.as_of_date=? ORDER BY r.run_id LIMIT 1",
+            (scenario_id, as_of_date),
         ).fetchone()
-        if index_row is None:
-            raise InvalidState("截止日期没有可用风险指数")
+        if frozen is not None:
+            result = json.loads(frozen["result_json"])
+            self._audit(
+                "scenario",
+                scenario_id,
+                "scenario.replayed",
+                actor_id,
+                {"run_id": frozen["run_id"], "as_of_date": as_of_date, "risk_index_input": result.get("risk_index_input")},
+            )
+            return {"run_id": frozen["run_id"], **result, "replayed": True}
+        # 兼容修复前已经落库的历史方案：按其存储的原结果重放，不重新计算。
+        legacy = self.connection.execute(
+            "SELECT run_id,result_json FROM response_scenario_runs WHERE scenario_id=? AND as_of_date=? "
+            "ORDER BY run_id LIMIT 1",
+            (scenario_id, as_of_date),
+        ).fetchone()
+        if legacy is not None:
+            result = json.loads(legacy["result_json"])
+            self._audit(
+                "scenario",
+                scenario_id,
+                "scenario.replayed",
+                actor_id,
+                {"run_id": legacy["run_id"], "as_of_date": as_of_date, "legacy": True},
+            )
+            return {"run_id": legacy["run_id"], **result, "replayed": True}
+        scenario = ResponseScenario.from_dict(json.loads(row["definition_json"]))
+        index_input = self._scenario_index_input(scenario.risk_index, as_of_date)
         road_corridors = self.connection.execute("SELECT * FROM road_corridors WHERE state='active' ORDER BY corridor_id").fetchall()
         inventory = self.connection.execute(
             "SELECT center_id,preservation_resource_kind,sum(CAST(available_units AS REAL)) available_units "
@@ -519,25 +571,20 @@ class CollectionLogisticsService:
         input_value = {
             "scenario_sha256": row["content_sha256"],
             "as_of_date": as_of_date,
-            "index": index_row["index_value"],
+            "risk_index_input": index_input,
             "road_corridors": [dict(item) for item in road_corridors],
             "inventory": [dict(item) for item in inventory],
         }
         input_sha256 = digest(input_value)
-        existing = self.connection.execute(
-            "SELECT run_id,result_json FROM response_scenario_runs WHERE scenario_id=? AND as_of_date=? AND input_sha256=?",
-            (scenario_id, as_of_date, input_sha256),
-        ).fetchone()
-        if existing is not None:
-            return {"run_id": existing["run_id"], **json.loads(existing["result_json"]), "replayed": True}
         result = scenario_projection(
-            current_index=Decimal(index_row["index_value"]),
+            current_index=Decimal(index_input["index_value"]),
             risk_index_drop_percent=scenario.risk_index_drop_percent,
             road_corridors=road_corridors,
             inventory=inventory,
             route_capacity_changes=scenario.route_capacity_changes,
             demand_changes=scenario.demand_changes,
         )
+        result["risk_index_input"] = {**index_input, "selected_as_of": as_of_date}
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
                 "INSERT INTO response_scenario_runs(scenario_id,as_of_date,input_sha256,result_json,created_by,created_at) "
@@ -545,7 +592,28 @@ class CollectionLogisticsService:
                 (scenario_id, as_of_date, input_sha256, canonical_json(result), actor_id, self._now()),
             )
             run_id = int(cursor.lastrowid)
-            self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
+            self.connection.execute(
+                "INSERT INTO response_scenario_run_inputs(run_id,risk_index,duty_date,risk_record_id,index_value,"
+                "source_revision,observed_at,recorded_by,recorded_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    run_id,
+                    index_input["risk_index"],
+                    index_input["duty_date"],
+                    int(index_input["risk_record_id"]),
+                    index_input["index_value"],
+                    index_input["source_revision"],
+                    index_input["observed_at"],
+                    index_input["recorded_by"],
+                    index_input["recorded_at"],
+                ),
+            )
+            self._audit(
+                "scenario",
+                scenario_id,
+                "scenario.executed",
+                actor_id,
+                {"run_id": run_id, "as_of_date": as_of_date, "risk_index_input": result["risk_index_input"]},
+            )
         return {"run_id": run_id, **result, "replayed": False}
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:

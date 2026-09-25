@@ -26,6 +26,13 @@ class InvalidState(CollectionDispatchError):
     status = 409
 
 
+class ScenarioInputMissing(CollectionDispatchError):
+    """情景绑定的指标系列在指定日期没有任何有效修订版本。"""
+
+    code = "scenario_input_missing"
+    status = 409
+
+
 class ValidationFailed(CollectionDispatchError):
     code = "validation_failed"
     status = 422

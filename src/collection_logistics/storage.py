@@ -171,6 +171,18 @@ CREATE TABLE IF NOT EXISTS response_scenario_runs (
     UNIQUE(scenario_id, as_of_date, input_sha256)
 );
 
+CREATE TABLE IF NOT EXISTS response_scenario_run_inputs (
+    run_id INTEGER PRIMARY KEY REFERENCES response_scenario_runs(run_id),
+    risk_index TEXT NOT NULL,
+    duty_date TEXT NOT NULL,
+    risk_record_id INTEGER NOT NULL REFERENCES risk_index_risk_records(risk_record_id),
+    index_value TEXT NOT NULL,
+    source_revision TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    recorded_by TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS traffic_idempotency (
     scope TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,

@@ -27,10 +27,13 @@ def run(workspace: Path) -> dict[str, object]:
     service.submit_dispatch("dispatch", {"dispatch_id": "nom-001", "corridor_id": "transfer-east-1", "specimen_event_id": "herbarium-room-east", "duty_date": "2026-09-25", "requested_units": "80000", "priority": 10, "idempotency_key": "nom-key-001"})
     allocation = service.allocate("dispatch", "transfer-east-1", "2026-09-25")
     deployment = service.dispatch_deployment("dispatch", "deployment-001", "nom-001", "lot-001", 2)
-    service.create_scenario("plan", {"scenario_id": "storage-recovery", "name": "主干路恢复通行与标本事件需求回落", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
+    service.create_scenario("plan", {"scenario_id": "storage-recovery", "name": "主干路恢复通行与标本事件需求回落", "risk_index": "HUMIDITY", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
     service.approve_scenario("risk", "storage-recovery", 1)
+    # 同一天补录虫害压力指数，验证情景只取绑定的湿度系列，不会串用虫害数值。
+    service.record_risk_record("plan", {"risk_index": "INJURY", "duty_date": "2026-09-23", "index_value": "37", "source_revision": "pest-23", "observed_at": "2026-09-23T23:00:00Z"})
     scenario = service.run_scenario("plan", "storage-recovery", "2026-09-23")
-    result = {"status": "ok", "index": service.risk_summary("HUMIDITY"), "plan_id": allocation["plan_id"], "deployment": deployment, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    scenario_replay = service.run_scenario("plan", "storage-recovery", "2026-09-23")
+    result = {"status": "ok", "index": service.risk_summary("HUMIDITY"), "plan_id": allocation["plan_id"], "deployment": deployment, "scenario_run_id": scenario["run_id"], "scenario_risk_index_input": scenario["risk_index_input"], "scenario_replayed": scenario_replay["replayed"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 

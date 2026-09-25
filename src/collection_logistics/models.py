@@ -226,6 +226,7 @@ class DispatchRequest:
 class ResponseScenario:
     scenario_id: str
     name: str
+    risk_index: str
     risk_index_drop_percent: Decimal
     route_capacity_changes: Mapping[str, Decimal]
     demand_changes: Mapping[str, Decimal]
@@ -236,6 +237,9 @@ class ResponseScenario:
         demand_changes = raw.get("demand_changes", {})
         if not isinstance(route_changes, Mapping) or not isinstance(demand_changes, Mapping):
             raise ValidationFailed("情景变化必须是对象")
+        risk_index = required_text(raw.get("risk_index"), "risk_index", 16).upper()
+        if risk_index not in RISK_INDEXES - {"CUSTOM"}:
+            raise ValidationFailed("risk_index 必须是 HUMIDITY、INJURY、CONGESTION、HAZMAT 或 SECONDARY")
         parsed_road_corridors = {
             identifier(key, "route_capacity_changes 键"): decimal_value(
                 value, f"route_capacity_changes.{key}", minimum=Decimal("-100"), maximum=Decimal("500")
@@ -251,6 +255,7 @@ class ResponseScenario:
         return cls(
             scenario_id=identifier(raw.get("scenario_id"), "scenario_id"),
             name=required_text(raw.get("name"), "name"),
+            risk_index=risk_index,
             risk_index_drop_percent=decimal_value(
                 raw.get("risk_index_drop_percent", 0),
                 "risk_index_drop_percent",
