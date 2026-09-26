@@ -70,6 +70,13 @@ def date_text(value: object, field: str) -> str:
         raise ValidationFailed(f"{field} 必须是 YYYY-MM-DD 日期") from exc
 
 
+def risk_index_series(value: object, field: str = "risk_index") -> str:
+    result = required_text(value, field, 16).upper()
+    if result not in RISK_INDEXES - {"CUSTOM"}:
+        raise ValidationFailed("risk_index 必须是 HUMIDITY、INJURY、CONGESTION、HAZMAT 或 SECONDARY")
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class RiskIndexRecord:
     risk_index: str
@@ -80,9 +87,7 @@ class RiskIndexRecord:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RiskIndexRecord":
-        risk_index = required_text(raw.get("risk_index"), "risk_index", 16).upper()
-        if risk_index not in RISK_INDEXES - {"CUSTOM"}:
-            raise ValidationFailed("risk_index 必须是 HUMIDITY、INJURY、CONGESTION、HAZMAT 或 SECONDARY")
+        risk_index = risk_index_series(raw.get("risk_index"))
         observed_at = required_text(raw.get("observed_at"), "observed_at", 40)
         try:
             parse_utc(observed_at, "observed_at")
@@ -226,6 +231,7 @@ class DispatchRequest:
 class ResponseScenario:
     scenario_id: str
     name: str
+    risk_index: str
     risk_index_drop_percent: Decimal
     route_capacity_changes: Mapping[str, Decimal]
     demand_changes: Mapping[str, Decimal]
@@ -251,6 +257,7 @@ class ResponseScenario:
         return cls(
             scenario_id=identifier(raw.get("scenario_id"), "scenario_id"),
             name=required_text(raw.get("name"), "name"),
+            risk_index=risk_index_series(raw.get("risk_index")),
             risk_index_drop_percent=decimal_value(
                 raw.get("risk_index_drop_percent", 0),
                 "risk_index_drop_percent",

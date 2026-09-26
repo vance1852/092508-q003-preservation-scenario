@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from collection_logistics.api import JsonApplication
 from collection_logistics.clock import FrozenClock
-from collection_logistics.errors import Conflict, Forbidden
+from collection_logistics.errors import Conflict, Forbidden, MissingRiskIndex, ValidationFailed
 from collection_logistics.planning import AllocationRequest, RiskPoint, allocate_capacity, latest_streak
 from collection_logistics.service import CollectionLogisticsService
 from collection_logistics.risk import DemandBucket, inventory_coverage, mark_to_risk, traffic_gap
@@ -108,7 +108,7 @@ class CollectionLogisticsServiceTests(unittest.TestCase):
     def test_scenario_is_approved_and_replayed_by_input(self) -> None:
         self.risk_record(23, "98")
         self.service.add_inventory_lot("dispatch", {"preservation_resource_lot_id": "lot-1", "center_id": "collection-east", "preservation_resource_kind": "preservation-box", "grade": "HUMIDITY", "quantity_units": "60000", "unit_cost_cny": "91", "received_at": "2026-09-24T06:00:00Z"})
-        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
+        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index": "HUMIDITY", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
         with self.assertRaises(Forbidden):
             self.service.approve_scenario("plan", "restart", 1)
         self.service.approve_scenario("risk", "restart", 1)
@@ -117,6 +117,65 @@ class CollectionLogisticsServiceTests(unittest.TestCase):
         self.assertFalse(first["replayed"])
         self.assertTrue(second["replayed"])
         self.assertEqual(first["run_id"], second["run_id"])
+
+    def test_scenario_requires_bound_risk_index(self) -> None:
+        with self.assertRaises(ValidationFailed):
+            self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index_drop_percent": "9"})
+        with self.assertRaises(ValidationFailed):
+            self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index": "PEST", "risk_index_drop_percent": "9"})
+
+    def test_scenario_picks_bound_series_when_multiple_series_share_a_day(self) -> None:
+        self.risk_record(23, "98")
+        self.service.record_risk_record("plan", {"risk_index": "INJURY", "duty_date": "2026-09-23", "index_value": "64", "source_revision": "r-23-pest", "observed_at": "2026-09-23T22:30:00Z"})
+        self.service.create_scenario("plan", {"scenario_id": "humid", "name": "调湿方案", "risk_index": "HUMIDITY", "risk_index_drop_percent": "9"})
+        self.service.approve_scenario("risk", "humid", 1)
+        run = self.service.run_scenario("plan", "humid", "2026-09-23")
+        self.assertEqual(run["risk_index_basis"]["risk_index"], "HUMIDITY")
+        self.assertEqual(run["risk_index_basis"]["index_value"], "98")
+        self.assertEqual(run["risk_index_basis"]["source_revision"], "r-23")
+
+    def test_missing_bound_series_returns_business_error(self) -> None:
+        self.risk_record(23, "98")
+        self.service.create_scenario("plan", {"scenario_id": "pest", "name": "虫害方案", "risk_index": "INJURY", "risk_index_drop_percent": "5"})
+        self.service.approve_scenario("risk", "pest", 1)
+        with self.assertRaises(MissingRiskIndex) as context:
+            self.service.run_scenario("plan", "pest", "2026-09-23")
+        self.assertEqual(context.exception.code, "missing_risk_index")
+        self.assertIn("INJURY", str(context.exception))
+        self.assertIn("2026-09-23", str(context.exception))
+
+    def test_historical_run_does_not_drift_after_later_correction(self) -> None:
+        self.risk_record(23, "98")
+        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index": "HUMIDITY", "risk_index_drop_percent": "9"})
+        self.service.approve_scenario("risk", "restart", 1)
+        first = self.service.run_scenario("plan", "restart", "2026-09-23")
+        # 次日才补录更正版本：recorded_at 晚于运行日期，当时尚未生效
+        self.clock.advance(days=1)
+        self.service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": "2026-09-23", "index_value": "80", "source_revision": "r-23-corrected", "observed_at": "2026-09-23T23:40:00Z"})
+        second = self.service.run_scenario("plan", "restart", "2026-09-23")
+        self.assertTrue(second["replayed"])
+        self.assertEqual(second["run_id"], first["run_id"])
+        self.assertEqual(second["risk_index_basis"]["risk_record_id"], first["risk_index_basis"]["risk_record_id"])
+        self.assertEqual(second["risk_index_basis"]["index_value"], "98")
+        self.assertEqual(second["risk_index_basis"]["source_revision"], "r-23")
+
+    def test_run_result_and_audit_event_show_actual_basis(self) -> None:
+        self.risk_record(23, "98")
+        self.service.create_scenario("plan", {"scenario_id": "restart", "name": "库房环境恢复", "risk_index": "HUMIDITY", "risk_index_drop_percent": "9"})
+        self.service.approve_scenario("risk", "restart", 1)
+        run = self.service.run_scenario("plan", "restart", "2026-09-23")
+        basis = run["risk_index_basis"]
+        self.assertEqual(
+            set(basis),
+            {"risk_index", "risk_record_id", "duty_date", "index_value", "source_revision", "observed_at", "recorded_at"},
+        )
+        payload = json.loads(
+            self.connection.execute(
+                "SELECT payload_json FROM traffic_audit_events WHERE event_type='scenario.executed'"
+            ).fetchone()["payload_json"]
+        )
+        self.assertEqual(payload["risk_index_basis"], basis)
+        self.assertEqual(payload["as_of_date"], "2026-09-23")
 
     def test_audit_chain_detects_tampering(self) -> None:
         self.assertTrue(self.service.audit_chain("audit")["valid"])

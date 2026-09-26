@@ -10,8 +10,8 @@ from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .errors import Conflict, Forbidden, InvalidState, MissingRiskIndex, NotFound, ValidationFailed
+from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario, date_text
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -480,7 +480,7 @@ class CollectionLogisticsService:
                 self._audit("scenario", scenario.scenario_id, "scenario.created", actor_id, {"sha256": content_sha256})
         except sqlite3.IntegrityError as exc:
             raise Conflict("情景编号或内容已经存在") from exc
-        return {"scenario_id": scenario.scenario_id, "state": "draft", "sha256": content_sha256}
+        return {"scenario_id": scenario.scenario_id, "state": "draft", "risk_index": scenario.risk_index, "sha256": content_sha256}
 
     def approve_scenario(self, actor_id: str, scenario_id: str, expected_revision: int) -> dict[str, Any]:
         self._require(actor_id, "scenario.approve")
@@ -495,8 +495,17 @@ class CollectionLogisticsService:
             self._audit("scenario", scenario_id, "scenario.approved", actor_id, {})
         return {"scenario_id": scenario_id, "state": "approved", "revision": expected_revision + 1}
 
+    def _risk_index_basis_row(self, risk_index: str, as_of_date: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT risk_record_id,risk_index,duty_date,index_value,source_revision,observed_at,recorded_at "
+            "FROM risk_index_risk_records WHERE risk_index=? AND duty_date<=? "
+            "ORDER BY duty_date DESC,risk_record_id DESC LIMIT 1",
+            (risk_index, as_of_date),
+        ).fetchone()
+
     def run_scenario(self, actor_id: str, scenario_id: str, as_of_date: str) -> dict[str, Any]:
         self._require(actor_id, "scenario.run")
+        as_of_date = date_text(as_of_date, "as_of_date")
         row = self.connection.execute(
             "SELECT * FROM response_scenarios WHERE scenario_id=?", (scenario_id,)
         ).fetchone()
@@ -504,13 +513,30 @@ class CollectionLogisticsService:
             raise NotFound("情景不存在")
         if row["state"] != "approved":
             raise InvalidState("只有已批准情景可以运行")
-        scenario = ResponseScenario.from_dict(json.loads(row["definition_json"]))
-        index_row = self.connection.execute(
-            "SELECT index_value FROM risk_index_risk_records WHERE duty_date<=? ORDER BY duty_date DESC,risk_record_id DESC LIMIT 1",
-            (as_of_date,),
+        # 同一方案在同一日期只允许一个结论：已运行的历史方案始终按冻结输入重放，
+        # 不受之后补录或更正的指标、库存数据影响而漂移。
+        existing = self.connection.execute(
+            "SELECT run_id,result_json FROM response_scenario_runs WHERE scenario_id=? AND as_of_date=? "
+            "ORDER BY run_id LIMIT 1",
+            (scenario_id, as_of_date),
         ).fetchone()
+        if existing is not None:
+            return {"run_id": existing["run_id"], **json.loads(existing["result_json"]), "replayed": True}
+        scenario = ResponseScenario.from_dict(json.loads(row["definition_json"]))
+        index_row = self._risk_index_basis_row(scenario.risk_index, as_of_date)
         if index_row is None:
-            raise InvalidState("截止日期没有可用风险指数")
+            raise MissingRiskIndex(
+                f"截至 {as_of_date} 指标系列 {scenario.risk_index} 在该日期及之前没有任何修订版本，无法运行情景"
+            )
+        basis = {
+            "risk_index": index_row["risk_index"],
+            "risk_record_id": index_row["risk_record_id"],
+            "duty_date": index_row["duty_date"],
+            "index_value": index_row["index_value"],
+            "source_revision": index_row["source_revision"],
+            "observed_at": index_row["observed_at"],
+            "recorded_at": index_row["recorded_at"],
+        }
         road_corridors = self.connection.execute("SELECT * FROM road_corridors WHERE state='active' ORDER BY corridor_id").fetchall()
         inventory = self.connection.execute(
             "SELECT center_id,preservation_resource_kind,sum(CAST(available_units AS REAL)) available_units "
@@ -519,18 +545,12 @@ class CollectionLogisticsService:
         input_value = {
             "scenario_sha256": row["content_sha256"],
             "as_of_date": as_of_date,
-            "index": index_row["index_value"],
+            "risk_index_basis": basis,
             "road_corridors": [dict(item) for item in road_corridors],
             "inventory": [dict(item) for item in inventory],
         }
         input_sha256 = digest(input_value)
-        existing = self.connection.execute(
-            "SELECT run_id,result_json FROM response_scenario_runs WHERE scenario_id=? AND as_of_date=? AND input_sha256=?",
-            (scenario_id, as_of_date, input_sha256),
-        ).fetchone()
-        if existing is not None:
-            return {"run_id": existing["run_id"], **json.loads(existing["result_json"]), "replayed": True}
-        result = scenario_projection(
+        projection = scenario_projection(
             current_index=Decimal(index_row["index_value"]),
             risk_index_drop_percent=scenario.risk_index_drop_percent,
             road_corridors=road_corridors,
@@ -538,14 +558,29 @@ class CollectionLogisticsService:
             route_capacity_changes=scenario.route_capacity_changes,
             demand_changes=scenario.demand_changes,
         )
+        result = {"risk_index_basis": basis, **projection}
         with transaction(self.connection, immediate=True):
+            # 在写事务内复查，确保并发首跑也只有一个冻结结论（先提交者胜出）。
+            locked_existing = self.connection.execute(
+                "SELECT run_id,result_json FROM response_scenario_runs WHERE scenario_id=? AND as_of_date=? "
+                "ORDER BY run_id LIMIT 1",
+                (scenario_id, as_of_date),
+            ).fetchone()
+            if locked_existing is not None:
+                return {"run_id": locked_existing["run_id"], **json.loads(locked_existing["result_json"]), "replayed": True}
             cursor = self.connection.execute(
                 "INSERT INTO response_scenario_runs(scenario_id,as_of_date,input_sha256,result_json,created_by,created_at) "
                 "VALUES(?,?,?,?,?,?)",
                 (scenario_id, as_of_date, input_sha256, canonical_json(result), actor_id, self._now()),
             )
             run_id = int(cursor.lastrowid)
-            self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
+            self._audit(
+                "scenario",
+                scenario_id,
+                "scenario.executed",
+                actor_id,
+                {"run_id": run_id, "as_of_date": as_of_date, "risk_index_basis": basis},
+            )
         return {"run_id": run_id, **result, "replayed": False}
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:

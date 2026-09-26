@@ -26,6 +26,10 @@ class InvalidState(CollectionDispatchError):
     status = 409
 
 
+class MissingRiskIndex(InvalidState):
+    code = "missing_risk_index"
+
+
 class ValidationFailed(CollectionDispatchError):
     code = "validation_failed"
     status = 422

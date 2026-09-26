@@ -15,11 +15,16 @@ from .service import CollectionLogisticsService
 def run(workspace: Path) -> dict[str, object]:
     connection = sqlite3.connect(":memory:", isolation_level=None)
     connection.row_factory = sqlite3.Row
-    service = CollectionLogisticsService(connection, FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc)))
+    clock = FrozenClock(datetime(2026, 9, 18, 8, 0, tzinfo=timezone.utc))
+    service = CollectionLogisticsService(connection, clock)
     for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")):
         service.create_user(user_id, user_id, role)
     for index, close in enumerate(("108", "105", "102", "100", "98", "96"), start=18):
         service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": f"2026-09-{index}", "index_value": close, "source_revision": f"rev-{index}", "observed_at": f"2026-09-{index}T21:00:00Z"})
+        if index == 23:
+            # 同一天补录虫害压力指数，绑定湿度系列的情景不得把它当作湿度基准
+            service.record_risk_record("plan", {"risk_index": "INJURY", "duty_date": "2026-09-23", "index_value": "64", "source_revision": "rev-23-pest", "observed_at": "2026-09-23T22:30:00Z"})
+        clock.advance(days=1)
     service.create_facility("plan", {"center_id": "collection-east", "name": "北部标本事件保藏中心", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_units": "500000"})
     service.create_facility("plan", {"center_id": "receiving-vault-b", "name": "沿海终端", "kind": "receiving-vault", "timezone": "Asia/Shanghai", "capacity_units": "800000"})
     service.create_route("plan", {"corridor_id": "transfer-east-1", "origin_center_id": "collection-east", "destination_center_id": "receiving-vault-b", "preservation_resource_kind": "preservation-box", "hourly_capacity": "100000", "delay_basis_points": 25, "response_minutes": 36})
@@ -27,10 +32,13 @@ def run(workspace: Path) -> dict[str, object]:
     service.submit_dispatch("dispatch", {"dispatch_id": "nom-001", "corridor_id": "transfer-east-1", "specimen_event_id": "herbarium-room-east", "duty_date": "2026-09-25", "requested_units": "80000", "priority": 10, "idempotency_key": "nom-key-001"})
     allocation = service.allocate("dispatch", "transfer-east-1", "2026-09-25")
     deployment = service.dispatch_deployment("dispatch", "deployment-001", "nom-001", "lot-001", 2)
-    service.create_scenario("plan", {"scenario_id": "storage-recovery", "name": "主干路恢复通行与标本事件需求回落", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
+    service.create_scenario("plan", {"scenario_id": "storage-recovery", "name": "连续降雨后调湿与标本事件需求回落", "risk_index": "HUMIDITY", "risk_index_drop_percent": "9", "route_capacity_changes": {"transfer-east-1": "20"}, "demand_changes": {"collection-east:preservation-box": "-5"}})
     service.approve_scenario("risk", "storage-recovery", 1)
     scenario = service.run_scenario("plan", "storage-recovery", "2026-09-23")
-    result = {"status": "ok", "index": service.risk_summary("HUMIDITY"), "plan_id": allocation["plan_id"], "deployment": deployment, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    # 次日更正 09-23 湿度：对已运行的历史方案无效，重放必须保持原输入
+    service.record_risk_record("plan", {"risk_index": "HUMIDITY", "duty_date": "2026-09-23", "index_value": "97.5", "source_revision": "rev-23-corrected", "observed_at": "2026-09-23T23:40:00Z"})
+    replay = service.run_scenario("plan", "storage-recovery", "2026-09-23")
+    result = {"status": "ok", "index": service.risk_summary("HUMIDITY"), "plan_id": allocation["plan_id"], "deployment": deployment, "scenario_run_id": scenario["run_id"], "scenario_basis": scenario["risk_index_basis"], "scenario_replay": {"run_id": replay["run_id"], "replayed": replay["replayed"], "risk_index_basis": replay["risk_index_basis"]}, "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 
